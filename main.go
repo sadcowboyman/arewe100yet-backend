@@ -33,6 +33,24 @@ func (c *Cache) Get() float64 {
 	return c.rate
 }
 
+// enableCORS is a middleware function that injects the required headers
+func enableCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "https://arewe100yet.in")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		// Important: Handle the browser's preflight OPTIONS request instantly
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Pass the request down to your actual handler logic
+		next.ServeHTTP(w, r)
+	})
+}
+
 // FIX: Return an error instead of using os.Exit(1) to keep the background worker from crashing the server
 func getExchangeRate() (float64, error) {
 	e := &ExchangeRateApiResponse{}
@@ -50,6 +68,7 @@ func getExchangeRate() (float64, error) {
 
 func main() {
 	cache := &Cache{}
+	mux := http.NewServeMux()
 
 	// 1. Initial load with error logging instead of an application crash
 	initialRate, err := getExchangeRate()
@@ -80,7 +99,7 @@ func main() {
 	defer c.Stop()
 
 	// 3. Set up your HTTP Server Routing
-	http.HandleFunc("/rate", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/rate", func(w http.ResponseWriter, r *http.Request) {
 		currentRate := cache.Get()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]float64{"USD_TO_INR": currentRate})
@@ -93,7 +112,7 @@ func main() {
 	}
 
 	log.Printf("Server starting on port %s...\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := http.ListenAndServe(":"+port, enableCORS(mux)); err != nil {
 		log.Fatalf("Server closed unexpectedly: %v", err)
 	}
 }

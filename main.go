@@ -10,87 +10,90 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+// Updated to map the provider's native UTC update string
 type ExchangeRateApiResponse struct {
 	Rates struct {
 		Inr float64 `json:"INR"`
 	} `json:"rates"`
+	TimeLastUpdateUtc string `json:"time_last_update_utc"`
 }
 
 type Cache struct {
-	mu   sync.RWMutex
-	rate float64
+	mu          sync.RWMutex
+	rate        float64
+	lastUpdated string
 }
 
-func (c *Cache) Set(rate float64) {
+func (c *Cache) Set(rate float64, timestamp string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rate = rate
+	c.lastUpdated = timestamp
 }
 
-func (c *Cache) Get() float64 {
+func (c *Cache) Get() (float64, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.rate
+	return c.rate, c.lastUpdated
 }
 
-// enableCORS is a middleware function that injects the required headers
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "https://arewe100yet.in")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-		// Important: Handle the browser's preflight OPTIONS request instantly
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// Pass the request down to your actual handler logic
 		next.ServeHTTP(w, r)
 	})
 }
 
-// FIX: Return an error instead of using os.Exit(1) to keep the background worker from crashing the server
-func getExchangeRate() (float64, error) {
+// Updated to return both the extracted rate and the API's update timestamp string
+func getExchangeRate() (float64, string, error) {
 	e := &ExchangeRateApiResponse{}
 	resp, err := http.Get("https://open.er-api.com/v6/latest/USD")
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer resp.Body.Close()
 
 	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return e.Rates.Inr, nil
+	
+	return e.Rates.Inr, e.TimeLastUpdateUtc, nil
 }
 
 func main() {
 	cache := &Cache{}
 	mux := http.NewServeMux()
 
-	// 1. Initial load with error logging instead of an application crash
-	initialRate, err := getExchangeRate()
+	// 1. Initial load pulling directly from the API response data fields
+	initialRate, apiTime, err := getExchangeRate()
 	if err != nil {
-		log.Printf("Warning: Initial API fetch failed (%v). Starting cache at 0.0.", err)
+		log.Printf("Warning: Initial API fetch failed (%v). Starting cache empty.", err)
 	} else {
-		cache.Set(initialRate)
-		log.Printf("Initial rate loaded successfully: %.2f\n", initialRate)
+		cache.Set(initialRate, apiTime)
+		log.Printf("Initial rate loaded successfully: %.2f (API Time: %s)\n", initialRate, apiTime)
 	}
 
-	// 2. Set up the background cron engine
+	// 2. Background cron synchronization engine
 	c := cron.New()
 	_, err = c.AddFunc("@hourly", func() {
 		log.Println("[Cron] Fetching fresh hourly rate...")
-		newRate, err := getExchangeRate()
+		newRate, apiUpdateTime, err := getExchangeRate()
 		if err != nil {
-			// FIX: Log the error and skip updating. The web server keeps running and serves the old cached rate.
 			log.Printf("[Cron Error] Failed to update rate: %v. Retaining previous cache.", err)
 			return
 		}
-		cache.Set(newRate)
-		log.Printf("[Cron] Cache updated successfully to: %.2f\n", newRate)
+		
+		// Saving the official API time string instead of machine time
+		cache.Set(newRate, apiUpdateTime)
+		log.Printf("[Cron] Cache updated successfully to: %.2f (API Time: %s)\n", newRate, apiUpdateTime)
 	})
 	if err != nil {
 		log.Fatalf("Error scheduling cron: %v", err)
@@ -98,17 +101,22 @@ func main() {
 	c.Start()
 	defer c.Stop()
 
-	// 3. Set up your HTTP Server Routing
+	// 3. Endpoint delivery pipeline
 	mux.HandleFunc("/rate", func(w http.ResponseWriter, r *http.Request) {
-		currentRate := cache.Get()
+		currentRate, lastUpdated := cache.Get()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]float64{"USD_TO_INR": currentRate})
+		
+		responsePayload := map[string]interface{}{
+			"USD_TO_INR":  currentRate,
+			"time_last_update_utc": lastUpdated, // Sends the API's string straight to your frontend
+		}
+		
+		_ = json.NewEncoder(w).Encode(responsePayload)
 	})
 
-	// FIX: Grab the dynamic port Render gives your application 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Fallback local development port if PORT env is empty
+		port = "8080"
 	}
 
 	log.Printf("Server starting on port %s...\n", port)
